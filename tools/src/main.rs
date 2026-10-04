@@ -57,6 +57,16 @@ fn main() -> Result<()> {
             flags::Lm::C1Run(args) => {
                 lm::c1_run(&args.data_dir, &args.units, &args.split, &args.output)?;
             }
+            flags::Lm::C1Recall(args) => {
+                lm::c1_recall(
+                    &args.data_dir,
+                    &args.units,
+                    &args.split,
+                    args.k,
+                    args.baseline,
+                    args.check_e1.as_deref(),
+                )?;
+            }
             flags::Lm::Compile(args) => {
                 lm::compile_lm(&args.lm_arpa, &args.words_txt, &args.output)?;
             }

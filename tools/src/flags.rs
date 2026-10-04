@@ -67,6 +67,26 @@ pub(crate) enum Lm {
     C1Prepare(LmC1Prepare),
     /// C1 pilot: decode units from an empty start and from the previous word
     C1Run(LmC1Run),
+    /// S0: how often the reference is among the deduplicated top-K candidates
+    C1Recall(LmC1Recall),
+}
+
+#[derive(Args)]
+pub(crate) struct LmC1Recall {
+    /// Directory with static_words.bin, static_dict.bin, rare_dict.bin, static_lm.bin
+    pub(crate) data_dir: PathBuf,
+    /// Units produced by c1-prepare
+    pub(crate) units: PathBuf,
+    /// Which split to evaluate (dev or test)
+    pub(crate) split: String,
+    /// Number of decoder paths before deduplication (1–255)
+    pub(crate) k: u8,
+    /// Baseline correct count for the oracle ratio; defaults to this K's first candidate
+    #[arg(long)]
+    pub(crate) baseline: Option<usize>,
+    /// E1 results (c1-run output); the first candidate must match per unit
+    #[arg(long)]
+    pub(crate) check_e1: Option<PathBuf>,
 }
 
 #[derive(Args)]

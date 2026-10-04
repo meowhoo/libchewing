@@ -635,9 +635,167 @@ pub(crate) fn c1_run(data_dir: &Path, units: &Path, split: &str, output: &Path) 
     Ok(())
 }
 
+// ---- recall (S0) ---------------------------------------------------------------
+
+/// Keeps the first occurrence of each candidate text, preserving order.
+/// Decoder output is sorted by cost, so the kept one is the cheapest.
+pub(crate) fn dedup_texts(texts: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    texts
+        .into_iter()
+        .filter(|t| seen.insert(t.clone()))
+        .collect()
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Recall {
+    pub(crate) units: usize,
+    /// Units whose first candidate equals the reference.
+    pub(crate) top1: usize,
+    /// Units whose reference is among the candidates.
+    pub(crate) found: usize,
+    pub(crate) candidates_total: usize,
+    pub(crate) candidates_max: usize,
+}
+
+impl Recall {
+    pub(crate) fn add(&mut self, reference: &str, candidates: &[String]) {
+        self.units += 1;
+        self.top1 += usize::from(candidates.first().is_some_and(|c| c == reference));
+        self.found += usize::from(candidates.iter().any(|c| c == reference));
+        self.candidates_total += candidates.len();
+        self.candidates_max = self.candidates_max.max(candidates.len());
+    }
+    /// `(found − baseline) ÷ (units − baseline)`; None when undefined.
+    pub(crate) fn oracle(&self, baseline: usize) -> Option<f64> {
+        let room = self.units.checked_sub(baseline).filter(|r| *r > 0)?;
+        Some((self.found as f64 - baseline as f64) / room as f64)
+    }
+}
+
+pub(crate) fn c1_recall(
+    data_dir: &Path,
+    units: &Path,
+    split: &str,
+    k: u8,
+    baseline: Option<usize>,
+    check_e1: Option<&Path>,
+) -> Result<()> {
+    let model = Model::open(data_dir)?;
+    let builder = model.lattice_builder();
+    let decoder = model.decoder();
+
+    let e1: Option<HashMap<String, String>> = match check_e1 {
+        Some(path) => {
+            #[derive(Deserialize)]
+            struct E1 {
+                id: String,
+                e1: String,
+            }
+            let mut map = HashMap::new();
+            for line in BufReader::new(File::open(path)?).lines() {
+                let r: E1 = serde_json::from_str(&line?)?;
+                map.insert(r.id, r.e1);
+            }
+            Some(map)
+        }
+        None => None,
+    };
+
+    let units: Vec<Unit> = BufReader::new(File::open(units)?)
+        .lines()
+        .map(|l| Ok(serde_json::from_str(&l?)?))
+        .collect::<Result<_>>()?;
+
+    let mut recall = Recall::default();
+    let mut e1_mismatch = 0;
+    for unit in units
+        .iter()
+        .filter(|u| u.split == split && u.status == "ok")
+    {
+        let mut comp = Composition::new();
+        for s in &unit.symbols {
+            let syl: Syllable = s
+                .parse()
+                .with_context(|| format!("bad syllable {s} in {}", unit.id))?;
+            comp.push(Symbol::Syllable(syl));
+        }
+        let texts = decoder
+            .decoden(builder.build_lattice(&comp), k)
+            .into_iter()
+            .map(|h| h.candidates.iter().map(|c| model.text_of(c)).collect())
+            .collect();
+        let candidates = dedup_texts(texts);
+        if let Some(e1) = &e1 {
+            let expected = e1
+                .get(&unit.id)
+                .with_context(|| format!("{} missing from E1 results", unit.id))?;
+            if candidates.first() != Some(expected) {
+                e1_mismatch += 1;
+            }
+        }
+        recall.add(&unit.text, &candidates);
+    }
+
+    if e1_mismatch > 0 {
+        bail!("{e1_mismatch} units: first candidate differs from the E1 results");
+    }
+    let base = baseline.unwrap_or(recall.top1);
+    println!("split\t{split}");
+    println!("k\t{k}");
+    println!("units\t{}", recall.units);
+    println!("top1_correct_this_k\t{}", recall.top1);
+    println!("baseline\t{base}");
+    println!("found_in_candidates\t{}", recall.found);
+    match recall.oracle(base) {
+        Some(o) => println!("oracle_improvement\t{o:.4}"),
+        None => println!("oracle_improvement\tN/A"),
+    }
+    println!(
+        "candidates_mean\t{:.2}",
+        recall.candidates_total as f64 / recall.units.max(1) as f64
+    );
+    println!("candidates_max\t{}", recall.candidates_max);
+    if check_e1.is_some() {
+        println!("e1_check\tok");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dedup_keeps_first_and_order() {
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            dedup_texts(v(&["甲", "乙", "甲", "丙", "乙"])),
+            v(&["甲", "乙", "丙"])
+        );
+    }
+
+    #[test]
+    fn recall_counts_and_oracle() {
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut r = Recall::default();
+        r.add("今天", &v(&["今天", "金天"])); // first is correct
+        r.add("天氣", &v(&["添氣", "天器", "天氣"])); // correct at position 3
+        r.add("出門", &v(&["初門"])); // missing
+        assert_eq!(
+            r,
+            Recall {
+                units: 3,
+                top1: 1,
+                found: 2,
+                candidates_total: 6,
+                candidates_max: 3,
+            }
+        );
+        // (2 − 1) ÷ (3 − 1)
+        assert_eq!(r.oracle(1), Some(0.5));
+        assert_eq!(r.oracle(3), None);
+    }
 
     #[test]
     fn levenshtein_counts_each_edit() {

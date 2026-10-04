@@ -5,7 +5,7 @@ mod learn;
 mod prepare;
 mod segment;
 
-pub(crate) use c1::{c1_prepare, c1_run};
+pub(crate) use c1::{c1_prepare, c1_recall, c1_run};
 pub(crate) use compile::compile_lm;
 pub(crate) use eval::eval;
 pub(crate) use learn::PruningConfig;
