@@ -63,6 +63,41 @@ pub(crate) enum Lm {
     Prepare(LmPrepare),
     /// Evaluate the conversion accuracy of a model
     Eval(LmEval),
+    /// C1 pilot: build scored input units from documents (JSONL)
+    C1Prepare(LmC1Prepare),
+    /// C1 pilot: decode units from an empty start and from the previous word
+    C1Run(LmC1Run),
+}
+
+#[derive(Args)]
+pub(crate) struct LmC1Prepare {
+    /// Directory with static_words.bin, static_dict.bin, rare_dict.bin, static_lm.bin
+    pub(crate) data_dir: PathBuf,
+    /// Word readings (chewing_v4/tsi_dict.csv)
+    pub(crate) tsi_dict: PathBuf,
+    /// Rare readings (chewing_v4/rare_dict.csv)
+    pub(crate) rare_dict: PathBuf,
+    /// Old dictionary with candidate priorities (chewing/tsi.csv)
+    pub(crate) old_tsi: PathBuf,
+    /// Documents, one JSON object per line with doc_id and text
+    pub(crate) docs: PathBuf,
+    /// Output units (JSONL)
+    pub(crate) output: PathBuf,
+    /// Seed for the dev/test document split
+    #[arg(long, default_value_t = 20261005)]
+    pub(crate) seed: u64,
+}
+
+#[derive(Args)]
+pub(crate) struct LmC1Run {
+    /// Directory with static_words.bin, static_dict.bin, rare_dict.bin, static_lm.bin
+    pub(crate) data_dir: PathBuf,
+    /// Units produced by c1-prepare
+    pub(crate) units: PathBuf,
+    /// Which split to evaluate (dev or test)
+    pub(crate) split: String,
+    /// Output per-unit results (JSONL)
+    pub(crate) output: PathBuf,
 }
 
 #[derive(Args)]

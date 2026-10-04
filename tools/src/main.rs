@@ -43,6 +43,20 @@ fn main() -> Result<()> {
             flags::Lm::Eval(args) => {
                 lm::eval(&args.search_path, &args.model_bin, args.alpha, args.verbose)?;
             }
+            flags::Lm::C1Prepare(args) => {
+                lm::c1_prepare(
+                    &args.data_dir,
+                    &args.tsi_dict,
+                    &args.rare_dict,
+                    &args.old_tsi,
+                    &args.docs,
+                    args.seed,
+                    &args.output,
+                )?;
+            }
+            flags::Lm::C1Run(args) => {
+                lm::c1_run(&args.data_dir, &args.units, &args.split, &args.output)?;
+            }
             flags::Lm::Compile(args) => {
                 lm::compile_lm(&args.lm_arpa, &args.words_txt, &args.output)?;
             }

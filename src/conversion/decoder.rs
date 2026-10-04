@@ -49,7 +49,16 @@ impl Decoder {
     /// # Returns
     ///
     /// A list of [`Hypothesis`] sorted from most likely to least likely.
-    pub fn decoden(&self, mut lattice: Lattice, n: u8) -> Vec<Hypothesis> {
+    pub fn decoden(&self, lattice: Lattice, n: u8) -> Vec<Hypothesis> {
+        self.decoden_from(lattice, n, Candidate::None)
+    }
+    /// Same as [`Decoder::decoden`], but the first transition is scored as
+    /// if `start` was the word right before the lattice.
+    ///
+    /// `start` only changes the initial decoding state: pruning still
+    /// scores edges from an empty start, and `start` never appears in the
+    /// returned hypotheses.
+    pub fn decoden_from(&self, mut lattice: Lattice, n: u8, start: Candidate) -> Vec<Hypothesis> {
         if lattice.edges.is_empty() {
             return vec![Hypothesis::default()];
         }
@@ -79,7 +88,7 @@ impl Decoder {
             }
         }
 
-        let paths = find_k_paths(n, &lattice, |w1, w2| self.cost_fun(w1, w2));
+        let paths = find_k_paths(n, &lattice, start, |w1, w2| self.cost_fun(w1, w2));
 
         debug_assert!(!paths.is_empty());
         paths
@@ -157,7 +166,7 @@ struct KEntry {
 /// Signal Processing, Albuquerque, NM, USA, 1990, pp. 81-84 vol.1, doi:
 /// 10.1109/ICASSP.1990.115542. keywords: {Natural languages;Acoustic
 /// beams;Speech},
-fn find_k_paths<F>(k: u8, lattice: &Lattice, cost_fn: F) -> Vec<Hypothesis>
+fn find_k_paths<F>(k: u8, lattice: &Lattice, start: Candidate, cost_fn: F) -> Vec<Hypothesis>
 where
     F: Fn(Candidate, Candidate) -> f64,
 {
@@ -168,8 +177,10 @@ where
     // layers[p]: up to k-best (cost, tid) prefixes ending at p with a surface.
     let mut layers: Vec<Vec<(Candidate, Vec<KEntry>)>> = vec![vec![]; len + 1];
 
+    // Trail 0 is a sentinel and is not part of any output, so the start
+    // word only affects the cost of the first transition.
     trails.push((0, Edge::default()));
-    layers[0].push((Candidate::None, vec![KEntry { cost: 0.0, tid: 0 }]));
+    layers[0].push((start, vec![KEntry { cost: 0.0, tid: 0 }]));
 
     for p in 0..len {
         let layer = std::mem::take(&mut layers[p]);
@@ -313,7 +324,7 @@ mod test {
                 candidates: vec![word(3),],
                 cost: 1.0
             }],
-            find_k_paths(1, &lattice, cost_fn)
+            find_k_paths(1, &lattice, Candidate::None, cost_fn)
         );
     }
 
@@ -353,7 +364,83 @@ mod test {
                 candidates: vec![word(1), word(2),],
                 cost: 3.0
             }],
-            find_k_paths(1, &lattice, cost_fn)
+            find_k_paths(1, &lattice, Candidate::None, cost_fn)
+        );
+    }
+
+    /// Two paths over two positions: [1, 2] or [3].
+    fn two_path_lattice() -> Lattice {
+        Lattice {
+            len: 2,
+            edges: vec![
+                vec![
+                    Edge {
+                        end: 1,
+                        cand: word(1),
+                    },
+                    Edge {
+                        end: 2,
+                        cand: word(3),
+                    },
+                ],
+                vec![Edge {
+                    end: 2,
+                    cand: word(2),
+                }],
+            ],
+        }
+    }
+
+    #[test]
+    fn start_word_only_affects_first_transition() {
+        use std::cell::RefCell;
+
+        const START: u32 = 9;
+        // Path [3] is cheaper unless the previous word is START.
+        let calls = RefCell::new(vec![]);
+        let cost_fn = |w1: Candidate, w2: Candidate| {
+            calls.borrow_mut().push((w1, w2));
+            match (w1, w2) {
+                (_, Candidate::Word { wid, .. }) if wid.0 == 3 && w1 == word(START) => 10.0,
+                (_, Candidate::Word { wid, .. }) if wid.0 == 3 => 1.0,
+                _ => 1.0,
+            }
+        };
+
+        let plain = find_k_paths(2, &two_path_lattice(), Candidate::None, cost_fn);
+        assert_eq!(plain[0].candidates, vec![word(3)]);
+
+        calls.borrow_mut().clear();
+        let with_start = find_k_paths(2, &two_path_lattice(), word(START), cost_fn);
+        assert_eq!(with_start[0].candidates, vec![word(1), word(2)]);
+        assert_eq!(with_start[0].cost, 2.0);
+        assert_eq!(with_start[1].candidates, vec![word(3)]);
+        assert_eq!(with_start[1].cost, 10.0);
+        // The start word never appears in the output.
+        for hyp in &with_start {
+            assert!(!hyp.candidates.contains(&word(START)));
+        }
+        // The start word is the previous word only for edges leaving
+        // position 0; later transitions use the decoded word.
+        for (w1, w2) in calls.borrow().iter() {
+            if *w1 == word(START) {
+                assert!(*w2 == word(1) || *w2 == word(3));
+            }
+        }
+        assert!(calls.borrow().contains(&(word(1), word(2))));
+    }
+
+    #[test]
+    fn none_start_matches_decoden() {
+        use crate::{conversion::Decoder, lm::StaticLm};
+
+        let decoder = Decoder {
+            lm: StaticLm::new(),
+            lambda: Decoder::LAMBDA,
+        };
+        assert_eq!(
+            decoder.decoden(two_path_lattice(), 10),
+            decoder.decoden_from(two_path_lattice(), 10, Candidate::None)
         );
     }
 
@@ -369,7 +456,7 @@ mod test {
                 candidates: vec![Candidate::None,],
                 cost: 0.0
             }],
-            find_k_paths(1, &lattice, |_, _| 1.0)
+            find_k_paths(1, &lattice, Candidate::None, |_, _| 1.0)
         );
     }
 }
