@@ -57,6 +57,10 @@ foreach(target ${ALL_TESTCASES})
         PROPERTIES
         ENVIRONMENT_MODIFICATION
         "PATH=path_list_prepend:$<TARGET_RUNTIME_DLL_DIRS:${target}>;RUST_LOG=set:trace"
+        # All test cases share TEST_HASH_DIR as the user directory and reset
+        # it at will. Running them concurrently lets one test see another's
+        # user phrases, so serialize them under `ctest -j`.
+        RESOURCE_LOCK chewing_test_user_dir
     )
 endforeach()
 
