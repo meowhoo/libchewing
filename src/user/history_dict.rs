@@ -107,7 +107,21 @@ impl HistoryDict {
             let mut records = BTreeMap::new();
 
             // Read record frames
-            for _ in 0..count {
+            //
+            // Older writers stored the number of distinct syllable keys
+            // instead of the number of frames. That count can be smaller
+            // than the real number of frames (homophones) or larger (empty
+            // keys left by remove). Read until a clean EOF so those files
+            // are recovered instead of truncated or rejected.
+            let mut read = 0;
+            loop {
+                if decoder.is_eof()? {
+                    break;
+                }
+                if read >= count {
+                    log::debug!("history dict has more frames than its header count {count}");
+                }
+                read += 1;
                 let len = decoder.read_uint()? as usize;
                 let mut syllables = SyllableVec::new();
                 for _ in 0..len {
@@ -151,7 +165,8 @@ impl HistoryDict {
             encoder.write_u32(0)?;
             encoder.write_u32(lock.half_life)?;
             encoder.write_u64(lock.generation)?;
-            encoder.write_u32(lock.records.len() as u32)?;
+            let frames: usize = lock.records.values().map(Vec::len).sum();
+            encoder.write_u32(frames as u32)?;
 
             for (syllables, entries) in lock.records.iter() {
                 for entry in entries {
@@ -196,9 +211,15 @@ impl HistoryDict {
             .write()
             .expect("Unable to acquire UserDict writer lock");
         let wid = lock.string_table.intern(word);
-        let hist_entries = lock.records.entry(syllables.into()).or_default();
+        let key: SyllableVec = syllables.into();
+        let Some(hist_entries) = lock.records.get_mut(&key) else {
+            return;
+        };
         if let Some(pos) = hist_entries.iter().position(|e| e.wid == wid) {
             hist_entries.remove(pos);
+        }
+        if hist_entries.is_empty() {
+            lock.records.remove(&key);
         }
     }
     // Return all words and their history based unigram log10 prob
@@ -260,3 +281,101 @@ fn true_count(h: u32, g: u64, c_i: u32, b_i: u64) -> u32 {
 }
 
 impl_context_error!(pub HistoryDictError);
+
+#[cfg(test)]
+mod tests {
+    use std::{error::Error, io::Cursor};
+
+    use super::HistoryDict;
+    use crate::{dictionary::StringTable, zhuyin::SyllableVec};
+
+    fn roundtrip(dict: &HistoryDict) -> Result<HistoryDict, Box<dyn Error>> {
+        let mut buf = vec![];
+        dict.to_writer(&mut buf)?;
+        Ok(HistoryDict::from_reader(
+            Cursor::new(buf),
+            StringTable::new(),
+        )?)
+    }
+
+    fn words(dict: &HistoryDict) -> Vec<String> {
+        let lock = dict.inner.read().unwrap();
+        let mut out: Vec<String> = lock
+            .records
+            .values()
+            .flatten()
+            .map(|e| lock.string_table.get_text(e.wid).unwrap())
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn roundtrip_keeps_homophones() -> Result<(), Box<dyn Error>> {
+        let dict = HistoryDict::new(StringTable::new());
+        let syl: SyllableVec = "ㄕˋ ㄕˊ".parse()?;
+        dict.observe(syl.as_ref(), "事實");
+        dict.observe(syl.as_ref(), "事時");
+        let loaded = roundtrip(&dict)?;
+        assert_eq!(words(&loaded), vec!["事實".to_string(), "事時".to_string()]);
+        Ok(())
+    }
+
+    /// Files written by older versions stored the number of syllable keys
+    /// as the frame count. Simulate that by patching the header.
+    fn with_header_count(dict: &HistoryDict, count: u32) -> Result<Vec<u8>, Box<dyn Error>> {
+        let mut buf = vec![];
+        dict.to_writer(&mut buf)?;
+        // "CHHD" (4) + version uint (1) + flags (4) + half_life (4) + generation (8)
+        const COUNT_OFFSET: usize = 21;
+        buf[COUNT_OFFSET..COUNT_OFFSET + 4].copy_from_slice(&count.to_le_bytes());
+        Ok(buf)
+    }
+
+    #[test]
+    fn read_legacy_file_with_too_small_count() -> Result<(), Box<dyn Error>> {
+        let dict = HistoryDict::new(StringTable::new());
+        let syl: SyllableVec = "ㄕˋ ㄕˊ".parse()?;
+        dict.observe(syl.as_ref(), "事實");
+        dict.observe(syl.as_ref(), "事時");
+        let buf = with_header_count(&dict, 1)?;
+        let loaded = HistoryDict::from_reader(Cursor::new(buf), StringTable::new())?;
+        assert_eq!(words(&loaded), vec!["事實".to_string(), "事時".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn read_legacy_file_with_too_large_count() -> Result<(), Box<dyn Error>> {
+        let dict = HistoryDict::new(StringTable::new());
+        let syl: SyllableVec = "ㄚ ㄇㄠ".parse()?;
+        dict.observe(syl.as_ref(), "阿貓");
+        let buf = with_header_count(&dict, 3)?;
+        let loaded = HistoryDict::from_reader(Cursor::new(buf), StringTable::new())?;
+        assert_eq!(words(&loaded), vec!["阿貓".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn truncated_frame_is_still_an_error() -> Result<(), Box<dyn Error>> {
+        let dict = HistoryDict::new(StringTable::new());
+        let syl: SyllableVec = "ㄚ ㄇㄠ".parse()?;
+        dict.observe(syl.as_ref(), "阿貓");
+        let mut buf = vec![];
+        dict.to_writer(&mut buf)?;
+        buf.truncate(buf.len() - 3);
+        assert!(HistoryDict::from_reader(Cursor::new(buf), StringTable::new()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn roundtrip_after_removing_unknown_word() -> Result<(), Box<dyn Error>> {
+        let dict = HistoryDict::new(StringTable::new());
+        let a: SyllableVec = "ㄚ ㄇㄠ".parse()?;
+        let b: SyllableVec = "ㄚ ㄍㄡˇ".parse()?;
+        dict.observe(a.as_ref(), "阿貓");
+        dict.remove(b.as_ref(), "阿狗");
+        let loaded = roundtrip(&dict)?;
+        assert_eq!(words(&loaded), vec!["阿貓".to_string()]);
+        Ok(())
+    }
+}

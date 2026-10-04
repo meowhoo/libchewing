@@ -2,7 +2,7 @@
 //!
 //! Ref: <https://www.ietf.org/archive/id/draft-devault-bare-15.html>
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 
 use scoped_error::impl_context_error;
 
@@ -15,6 +15,13 @@ pub(crate) struct BareDecoder<R> {
 impl<R: Read> BareDecoder<R> {
     pub(crate) fn new(reader: R) -> Self {
         BareDecoder { reader }
+    }
+}
+
+impl<R: BufRead> BareDecoder<R> {
+    /// Whether the underlying reader has no more data.
+    pub(crate) fn is_eof(&mut self) -> std::io::Result<bool> {
+        Ok(self.reader.fill_buf()?.is_empty())
     }
 }
 
