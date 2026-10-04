@@ -3,6 +3,7 @@
 pub(crate) mod dict;
 pub(crate) mod history_dict;
 pub(crate) mod migrate;
+pub(crate) mod sync;
 
 pub use self::dict::{UserDict, UserDictError};
 pub use self::history_dict::{HistoryDict, HistoryDictError};

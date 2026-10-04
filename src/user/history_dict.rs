@@ -3,7 +3,7 @@
 //! The auto user vocabulary list stores new words learned from user interactions
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::File,
     io::{BufRead, BufReader, Write},
     ops::Bound::{Excluded, Included},
@@ -32,6 +32,16 @@ struct HistoryDictInner {
     half_life: u32,
     generation: u64,
     records: BTreeMap<SyllableVec, Vec<HistoryDictEntry>>,
+}
+
+/// Content of a [`HistoryDict`] as plain data, used for merging.
+///
+/// Entries map (syllables, word) to (seen, epoch).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct HistorySnapshot {
+    pub(crate) half_life: u32,
+    pub(crate) generation: u64,
+    pub(crate) entries: BTreeMap<(SyllableVec, String), (u32, u64)>,
 }
 
 #[derive(Debug)]
@@ -150,11 +160,36 @@ impl HistoryDict {
         })
     }
     pub fn to_writer<W: Write>(&self, writer: W) -> Result<(), HistoryDictError> {
+        Self::write_snapshot(&self.snapshot(), writer)
+    }
+    /// Copy of the whole dictionary as plain data, used for merging.
+    pub(crate) fn snapshot(&self) -> HistorySnapshot {
+        let lock = self
+            .inner
+            .read()
+            .expect("Unable to acquire HistoryDict reader lock");
+        let mut entries = BTreeMap::new();
+        for (syllables, words) in lock.records.iter() {
+            for entry in words {
+                let word = lock
+                    .string_table
+                    .get_text(entry.wid)
+                    .expect("Should have this word");
+                entries.insert((*syllables, word), (entry.seen, entry.epoch));
+            }
+        }
+        HistorySnapshot {
+            half_life: lock.half_life,
+            generation: lock.generation,
+            entries,
+        }
+    }
+    /// Writes a snapshot in the history dictionary file format.
+    pub(crate) fn write_snapshot<W: Write>(
+        snapshot: &HistorySnapshot,
+        writer: W,
+    ) -> Result<(), HistoryDictError> {
         expect_error("Unable to serialize the history dictionary", || {
-            let lock = self
-                .inner
-                .read()
-                .expect("Unable to acquire HistoryDict reader lock");
             let mut encoder = BareEncoder::new(writer);
 
             // Write file magic
@@ -163,28 +198,70 @@ impl HistoryDict {
             encoder.write_uint(0)?;
             // Write HistoryDictHeader flags
             encoder.write_u32(0)?;
-            encoder.write_u32(lock.half_life)?;
-            encoder.write_u64(lock.generation)?;
-            let frames: usize = lock.records.values().map(Vec::len).sum();
-            encoder.write_u32(frames as u32)?;
+            encoder.write_u32(snapshot.half_life)?;
+            encoder.write_u64(snapshot.generation)?;
+            encoder.write_u32(snapshot.entries.len() as u32)?;
 
-            for (syllables, entries) in lock.records.iter() {
-                for entry in entries {
-                    encoder.write_uint(syllables.len() as u64)?;
-                    for syl in syllables {
-                        encoder.write_u16(syl.to_u16())?;
-                    }
-                    let word = lock
-                        .string_table
-                        .get_text(entry.wid)
-                        .expect("Should have this word");
-                    encoder.write_data(word.as_bytes())?;
-                    encoder.write_u32(entry.seen)?;
-                    encoder.write_u64(entry.epoch)?;
+            for ((syllables, word), (seen, epoch)) in snapshot.entries.iter() {
+                encoder.write_uint(syllables.len() as u64)?;
+                for syl in syllables {
+                    encoder.write_u16(syl.to_u16())?;
                 }
+                encoder.write_data(word.as_bytes())?;
+                encoder.write_u32(*seen)?;
+                encoder.write_u64(*epoch)?;
             }
             Ok(())
         })
+    }
+    /// Brings the in-memory dictionary from `ours` to `merged`.
+    ///
+    /// `ours` is the snapshot the merge was computed from. Entries that
+    /// changed in memory after that snapshot was taken are left alone. The
+    /// generation counter advances by the observations merged in from
+    /// other writers.
+    pub(crate) fn apply_merge(&self, ours: &HistorySnapshot, merged: &HistorySnapshot) {
+        let mut lock = self
+            .inner
+            .write()
+            .expect("Unable to acquire HistoryDict writer lock");
+        let advance = merged.generation.saturating_sub(ours.generation);
+        lock.generation += advance;
+        lock.half_life = merged.half_life;
+        let keys: BTreeSet<_> = ours.entries.keys().chain(merged.entries.keys()).collect();
+        for key in keys {
+            let (old, new) = (ours.entries.get(key), merged.entries.get(key));
+            if old == new {
+                continue;
+            }
+            let (syllables, word) = key;
+            let wid = lock.string_table.intern(word);
+            let generation = lock.generation;
+            let words = lock.records.entry(*syllables).or_default();
+            let pos = words.iter().position(|e| e.wid == wid);
+            let current = pos.map(|p| (words[p].seen, words[p].epoch));
+            if current.as_ref() != old {
+                continue;
+            }
+            match (pos, new) {
+                (Some(p), Some(&(seen, epoch))) => {
+                    words[p].seen = seen;
+                    words[p].epoch = epoch.min(generation);
+                }
+                (Some(p), None) => {
+                    words.remove(p);
+                }
+                (None, Some(&(seen, epoch))) => words.push(HistoryDictEntry {
+                    wid,
+                    seen,
+                    epoch: epoch.min(generation),
+                }),
+                (None, None) => {}
+            }
+            if words.is_empty() {
+                lock.records.remove(syllables);
+            }
+        }
     }
     pub(crate) fn observe(&self, syllables: &[Syllable], word: &str) {
         let mut lock = self

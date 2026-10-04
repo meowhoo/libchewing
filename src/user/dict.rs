@@ -1,7 +1,7 @@
 //! User editable dictionary source
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt::Display,
     fs::File,
     io::{BufRead, BufReader, Write},
@@ -33,6 +33,9 @@ struct UserDictInner {
     string_table: StringTable,
     records: BTreeMap<SyllableVec, Vec<UserDictEntry>>,
 }
+
+/// Content of a [`UserDict`] as a plain map, used for merging.
+pub(crate) type UserSnapshot = BTreeMap<(SyllableVec, String), i8>;
 
 #[derive(Debug, Clone, Copy)]
 struct UserDictEntry {
@@ -112,29 +115,81 @@ impl UserDict {
         })
     }
     /// Writes the user dictionary to an IO stream
-    pub fn to_writer<W: Write>(&self, mut writer: W) -> Result<(), UserDictError> {
+    pub fn to_writer<W: Write>(&self, writer: W) -> Result<(), UserDictError> {
+        Self::write_snapshot(&self.snapshot(), writer)
+    }
+    /// Copy of all entries keyed by syllables and word, with their boost.
+    pub(crate) fn snapshot(&self) -> UserSnapshot {
+        let lock = self
+            .inner
+            .read()
+            .expect("Unable to acquire UserDict reader lock");
+        let mut snapshot = UserSnapshot::new();
+        for (syllables, entries) in lock.records.iter() {
+            for entry in entries {
+                let word = lock
+                    .string_table
+                    .get_text(entry.wid)
+                    .expect("Should have this word");
+                snapshot.insert((*syllables, word), entry.boost);
+            }
+        }
+        snapshot
+    }
+    /// Writes a snapshot in the user dictionary file format.
+    pub(crate) fn write_snapshot<W: Write>(
+        snapshot: &UserSnapshot,
+        mut writer: W,
+    ) -> Result<(), UserDictError> {
         expect_error("Unable to serialize the user dictionary", || {
-            let lock = self
-                .inner
-                .read()
-                .expect("Unable to acquire UserDict reader lock");
-            for (syllables, entries) in lock.records.iter() {
-                for entry in entries {
-                    let word = lock
-                        .string_table
-                        .get_text(entry.wid)
-                        .expect("Should have this word");
-                    writeln!(
-                        writer,
-                        "{},{},{}",
-                        word,
-                        display_syllables(syllables),
-                        entry.boost
-                    )?;
-                }
+            for ((syllables, word), boost) in snapshot {
+                writeln!(
+                    writer,
+                    "{},{},{}",
+                    word,
+                    display_syllables(syllables),
+                    boost
+                )?;
             }
             Ok(())
         })
+    }
+    /// Brings the in-memory dictionary from `ours` to `merged`.
+    ///
+    /// `ours` is the snapshot the merge was computed from. Entries that
+    /// changed in memory after that snapshot was taken are left alone, so
+    /// local edits made during a background merge are not lost.
+    pub(crate) fn apply_merge(&self, ours: &UserSnapshot, merged: &UserSnapshot) {
+        let mut lock = self
+            .inner
+            .write()
+            .expect("Unable to acquire UserDict writer lock");
+        let keys: BTreeSet<_> = ours.keys().chain(merged.keys()).collect();
+        for key in keys {
+            let (old, new) = (ours.get(key), merged.get(key));
+            if old == new {
+                continue;
+            }
+            let (syllables, word) = key;
+            let wid = lock.string_table.intern(word);
+            let entries = lock.records.entry(*syllables).or_default();
+            let pos = entries.iter().position(|e| e.wid == wid);
+            let current = pos.map(|p| entries[p].boost);
+            if current.as_ref() != old {
+                continue;
+            }
+            match (pos, new) {
+                (Some(p), Some(&boost)) => entries[p].boost = boost,
+                (Some(p), None) => {
+                    entries.remove(p);
+                }
+                (None, Some(&boost)) => entries.push(UserDictEntry { wid, boost }),
+                (None, None) => {}
+            }
+            if entries.is_empty() {
+                lock.records.remove(syllables);
+            }
+        }
     }
     pub fn get_text(&self, wid: WordId) -> Option<String> {
         let lock = self
@@ -215,13 +270,21 @@ impl UserDict {
             }
         }
     }
+    /// Iterates over a copy of the entries.
+    ///
+    /// The reader lock is released before returning, so holding the
+    /// iterator (for example across C API enumeration calls) does not block
+    /// writers.
     pub fn entries(&self) -> impl Iterator<Item = (SyllableVec, String)> + '_ {
-        let lock = self
-            .inner
-            .read()
-            .expect("Unable to acquire UserDict reader lock");
-        lock.records.clone().into_iter().flat_map(move |(k, v)| {
-            let st = lock.string_table.clone();
+        let (records, st) = {
+            let lock = self
+                .inner
+                .read()
+                .expect("Unable to acquire UserDict reader lock");
+            (lock.records.clone(), lock.string_table.clone())
+        };
+        records.into_iter().flat_map(move |(k, v)| {
+            let st = st.clone();
             v.into_iter()
                 .map(move |ent| (k, st.get_text(ent.wid).unwrap()))
         })

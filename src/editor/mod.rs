@@ -5,10 +5,11 @@ use std::{
     cmp::{max, min},
     fmt::Debug,
     fs::{self, File},
-    hash::{DefaultHasher, Hash, Hasher},
-    io::{BufReader, BufWriter},
+    io::BufReader,
     mem,
     path::PathBuf,
+    sync::{Arc, Mutex},
+    thread::{self, JoinHandle},
 };
 
 use log::{debug, error, info, warn};
@@ -29,7 +30,7 @@ use crate::{
     input::{KeyState, KeyboardEvent, keysym::*},
     lm::{LoadMode, StaticDict, StaticLm},
     path::SearchPath,
-    user::{HistoryDict, UserDict, migrate_v3_to_v4, should_migrate_from_v3},
+    user::{HistoryDict, UserDict, migrate_v3_to_v4, should_migrate_from_v3, sync::UserDataSync},
     zhuyin::{Syllable, SyllableVec},
 };
 
@@ -155,7 +156,10 @@ pub struct Editor {
 pub(crate) struct SharedState {
     // static_words_path: PathBuf,
     // static_dict_path: PathBuf,
-    user_datadir: Option<PathBuf>,
+    /// Merges the user dictionaries with the files in the user directory.
+    user_sync: Option<Arc<Mutex<UserDataSync>>>,
+    /// Background sync started from the key handling path, if any.
+    pending_sync: Mutex<Option<JoinHandle<()>>>,
     // static_words: StringTable,
     // static_dict: StaticDict,
     com: CompositionEditor,
@@ -321,9 +325,12 @@ impl Editor {
         abbr: AbbrevTable,
         sym_sel: SymbolSelector,
     ) -> Editor {
+        let user_sync = user_datadir
+            .map(|dir| Arc::new(Mutex::new(UserDataSync::new(dir, &user_dict, &hist_dict))));
         Editor {
             shared: SharedState {
-                user_datadir,
+                user_sync,
+                pending_sync: Mutex::new(None),
                 com: CompositionEditor::default(),
                 syl: Box::new(Standard::new()),
                 conv,
@@ -682,59 +689,77 @@ impl Editor {
     pub fn notification(&self) -> &str {
         &self.shared.notice_buffer
     }
+    /// Merges the user dictionaries with the user directory and writes
+    /// them, waiting for completion.
+    ///
+    /// Other processes sharing the user directory keep what they learned;
+    /// see [`crate::user::sync`].
     pub fn flush(&self) {
-        if let Some(ud) = self.shared.user_datadir.clone() {
-            let user_dict = self.shared.user_dict.clone();
-            let hist_dict = self.shared.hist_dict.clone();
+        self.shared.wait_pending_sync();
+        self.shared.sync_user_data();
+    }
+}
 
-            let mut file_options = File::options();
-            file_options.create(true).write(true);
+impl Drop for Editor {
+    fn drop(&mut self) {
+        self.shared.wait_pending_sync();
+    }
+}
 
-            #[cfg(target_family = "unix")]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                file_options.mode(0o600);
+impl SharedState {
+    fn sync_user_data(&self) {
+        if let Some(sync) = &self.user_sync {
+            let mut sync = sync.lock().expect("user data sync poisoned");
+            if let Err(err) = sync.sync(&self.user_dict, &self.hist_dict) {
+                error!("{}", err.report());
             }
-            let mut hasher = DefaultHasher::new();
-
-            1.hash(&mut hasher);
-            let user_dict_path = ud.join("user_dict.csv");
-            let temp_path = ud.join(format!("{:x}.tmp", hasher.finish()));
-            let temp_file = match file_options.open(&temp_path) {
-                Ok(f) => f,
-                Err(err) => {
-                    error!("Unable to open file: {err}");
-                    return;
-                }
-            };
-            if let Err(err) = user_dict.to_writer(BufWriter::new(temp_file)) {
-                error!("Unable to write user dict file: {err}");
-                return;
-            };
-            if let Err(err) = fs::rename(&temp_path, &user_dict_path) {
-                error!("Unable to write user dict file: {err}");
-                return;
-            };
-
-            2.hash(&mut hasher);
-            let hist_dict_path = ud.join("history_dict.bin");
-            let temp_path = ud.join(format!("{:x}.tmp", hasher.finish()));
-            let temp_file = match file_options.open(&temp_path) {
-                Ok(f) => f,
-                Err(err) => {
-                    error!("Unable to open file: {err}");
-                    return;
-                }
-            };
-            if let Err(err) = hist_dict.to_writer(BufWriter::new(temp_file)) {
-                error!("Unable to write user dict file: {err}");
-                return;
-            };
-            if let Err(err) = fs::rename(&temp_path, &hist_dict_path) {
-                error!("Unable to write user dict file: {err}");
-                return;
-            };
         }
+    }
+    fn wait_pending_sync(&self) {
+        let pending = self
+            .pending_sync
+            .lock()
+            .expect("pending sync poisoned")
+            .take();
+        if let Some(handle) = pending {
+            let _ = handle.join();
+        }
+    }
+    /// Starts a sync without blocking key handling.
+    ///
+    /// Returns false when a previous background sync is still running; the
+    /// caller keeps its dirty state and tries again on a later key.
+    fn sync_user_data_in_background(&self) -> bool {
+        let Some(sync) = self.user_sync.clone() else {
+            return true;
+        };
+        let mut pending = self.pending_sync.lock().expect("pending sync poisoned");
+        if pending.as_ref().is_some_and(|h| !h.is_finished()) {
+            return false;
+        }
+        if let Some(finished) = pending.take() {
+            let _ = finished.join();
+        }
+        let user_dict = self.user_dict.clone();
+        let hist_dict = self.hist_dict.clone();
+        let spawned = thread::Builder::new()
+            .name("chewing-user-sync".into())
+            .spawn(move || {
+                let mut sync = sync.lock().expect("user data sync poisoned");
+                if let Err(err) = sync.sync(&user_dict, &hist_dict) {
+                    error!("{}", err.report());
+                }
+            });
+        match spawned {
+            Ok(handle) => *pending = Some(handle),
+            Err(err) => {
+                // Threads are unavailable on some targets; sync inline.
+                debug!("unable to spawn sync thread: {err}");
+                drop(pending);
+                self.sync_user_data();
+            }
+        }
+        true
     }
 }
 
@@ -865,6 +890,7 @@ impl SharedState {
             let phrases = self.user_dict.lookup(syllables, LookupStrategy::Standard);
             if !phrases.iter().any(|p| p.0 == wid) {
                 self.user_dict.insert(syllables, phrase);
+                self.dirty_level += 1;
                 return Ok(());
             }
             self.hist_dict.observe(syllables, phrase);
@@ -1024,8 +1050,7 @@ impl BasicEditor for Editor {
         debug!("last_key_behavior = {:?}", self.shared.last_key_behavior);
         debug!("comp: {:?}", &self.shared.com);
         const DIRTY_THRESHOLD: u16 = 0;
-        if self.shared.dirty_level > DIRTY_THRESHOLD {
-            let _ = self.flush();
+        if self.shared.dirty_level > DIRTY_THRESHOLD && self.shared.sync_user_data_in_background() {
             self.shared.dirty_level = 0;
         }
         self.shared.last_key_behavior
